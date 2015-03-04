@@ -10,8 +10,14 @@ It is compatible with a large range of terminal emulators on Linux and OSX syste
 ------------
 Installation
 ------------
-Reddit Terminal Viewer is Py2/Py3 compatible and can be installed via python setuptools.
- 
+Reddit Terminal Viewer is Py2/Py3 compatible. The quickest way to install is through pip.
+
+.. code-block:: bash
+   
+   $ sudo pip install --pre rtv
+
+Alternatively, you can install directly from the repo using python setuptools.
+
 .. code-block:: bash
 
    $ git clone https://github.com/michael-lazar/rtv.git
