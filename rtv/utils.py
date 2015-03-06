@@ -2,8 +2,14 @@ import os
 import curses
 import time
 import threading
-from curses import textpad
+import subprocess
+from curses import textpad, ascii
 from contextlib import contextmanager
+from functools import partial
+from types import MethodType
+
+from six.moves import configparser
+from six import create_bound_method
 
 from .errors import EscapePressed
 
@@ -43,6 +49,33 @@ class Color(object):
             curses.init_pair(index, code[0], code[1])
             setattr(cls, attr, curses.color_pair(index))
 
+def load_config():
+    """
+    Search for a configuration file at the location ~/.rtv and attempt to load
+    saved settings for things like the username and password.
+    """
+
+    config_path = os.path.join(os.path.expanduser('~'), '.rtv')
+    config = configparser.ConfigParser()
+    config.read(config_path)
+
+    defaults = {}
+    if config.has_section('rtv'):
+        defaults = dict(config.items('rtv'))
+
+    return defaults
+
+def patch_popen():
+    """
+    Patch subprocess.Popen default behavior to redirect stdout + stderr to null.
+    This is a hack to stop the webbrowser from spewing errors in firefox.
+    """
+
+    # http://stackoverflow.com/a/13359757/2526287
+    stdout = open(os.devnull, 'w')
+    func = partial(subprocess.Popen.__init__,
+                   stdout=stdout, stderr=stdout, close_fds=True)
+    subprocess.Popen.__init__ = create_bound_method(func, subprocess.Popen)
 
 def text_input(window):
     """
@@ -59,8 +92,14 @@ def text_input(window):
 
     def validate(ch):
         "Filters characters for special key sequences"
+
         if ch == ESCAPE:
             raise EscapePressed
+
+        # Fix backspace for iterm
+        if ch == ascii.DEL:
+            ch = curses.KEY_BACKSPACE
+
         return ch
 
     # Wrapping in an exception block so that we can distinguish when the user
@@ -200,6 +239,9 @@ def curses_session():
 
         # Hide blinking cursor
         curses.curs_set(0)
+
+        # Breaks python3
+        # patch_popen()
 
         yield stdscr
 

@@ -1,22 +1,27 @@
 ======================
 Reddit Terminal Viewer
 ======================
+
+.. image:: https://pypip.in/version/rtv/badge.svg?text=version
+    :target: https://pypi.python.org/pypi/rtv/
+    :alt: Latest Version
+
 **Reddit Terminal Viewer (RTV)** is a lightweight browser for Reddit (www.reddit.com) built into a terminal window.
 RTV is built in Python and utilizes the **curses** library. 
 It is compatible with a large range of terminal emulators on Linux and OSX systems. 
 
-.. image:: /resources/demo.gif
+.. image:: http://i.imgur.com/4a3Yrov.gif
 
 ------------
 Installation
 ------------
-Reddit Terminal Viewer is Py2/Py3 compatible. The quickest way to install is through pip.
+The recommended installation method is pip.
 
 .. code-block:: bash
    
    $ sudo pip install --pre rtv
 
-Alternatively, you can install directly from the repo using python setuptools.
+Alternatively, clone the repo and install with python.
 
 .. code-block:: bash
 
@@ -24,16 +29,11 @@ Alternatively, you can install directly from the repo using python setuptools.
    $ cd rtv
    $ sudo python setup.py install
 
-After the installation has finished, a script will be placed in the system path. The program can then be started by typing
+As part of the installation, an executable script will be placed in your system path.
 
 .. code-block:: bash
 
    $ rtv
-
-Additional options can be viewed with
-
-.. code-block:: bash
-
    $ rtv --help
 
 -----
@@ -47,6 +47,7 @@ RTV currently supports browsing both subreddits and individual submissions. In e
 :``Arrow Keys`` or ``hjkl``: RTV supports both the arrow keys and vim bindings for navigation. Move up and down to scroll through items on the page.
 :``r`` or ``F5``: Refresh the current page.
 :``q``: Quit the program.
+:``o``: Open the url of the selected item in the default web browser.
 
 **Subreddit Mode**
 

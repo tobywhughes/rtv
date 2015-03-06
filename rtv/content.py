@@ -180,7 +180,8 @@ class BaseContent(object):
                           else '[deleted]')
         data['permalink'] = clean(sub.permalink)
         data['subreddit'] = strip_subreddit_url(sub.permalink)
-        data['url'] = ('(selfpost)' if is_selfpost(sub.url) else clean(sub.url))
+        data['url_full'] = clean(sub.url)
+        data['url'] = ('selfpost' if is_selfpost(sub.url) else clean(sub.url))
 
         return data
 
@@ -326,9 +327,6 @@ class SubredditContent(BaseContent):
 
     @classmethod
     def from_name(cls, reddit, name, loader=default_loader, display_type = 'hot'):
-
-        if name == 'front':
-            return cls('Front Page', reddit.get_front_page(limit=None), loader)
 
         if name == 'new':
             return cls('New', reddit.get_new(limit=None), loader)
