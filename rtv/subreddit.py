@@ -1,104 +1,159 @@
 import curses
-import sys
-import webbrowser
-from requests.exceptions import HTTPError
+import time
+import logging
 
-from .errors import SubredditNameError
-from .page import BasePage
+import requests
+import praw
+
+from .exceptions import SubredditError, AccountError
+from .page import BasePage, Navigator, BaseController
 from .submission import SubmissionPage
 from .content import SubredditContent
-from .utils import LoadScreen, text_input, display_message, Color, ESCAPE
+from .helpers import clean, open_browser, open_editor
+from .docs import SUBMISSION_FILE
+from .curses_helpers import (BULLET, UARROW, DARROW, GOLD, Color,
+                             LoadScreen, show_notification)
+
+__all__ = ['opened_links', 'SubredditController', 'SubredditPage']
+
+_logger = logging.getLogger(__name__)
+
+# Used to keep track of browsing history across the current session
+opened_links = set()
+
+
+class SubredditController(BaseController):
+    character_map = {}
+
 
 class SubredditPage(BasePage):
 
     def __init__(self, stdscr, reddit, name):
 
-        self.reddit = reddit
-        self.name = name
+        self.controller = SubredditController(self)
         self.loader = LoadScreen(stdscr)
 
         content = SubredditContent.from_name(reddit, name, self.loader)
-        super(SubredditPage, self).__init__(stdscr, content)
+        super(SubredditPage, self).__init__(stdscr, reddit, content)
 
     def loop(self):
+        "Main control loop"
 
-        self.draw()
         while True:
+            self.draw()
             cmd = self.stdscr.getch()
+            self.controller.trigger(cmd)
 
-            if cmd in (curses.KEY_UP, ord('k')):
-                self.move_cursor_up()
-                self.clear_input_queue()
-
-            elif cmd in (curses.KEY_DOWN, ord('j')):
-                self.move_cursor_down()
-                self.clear_input_queue()
-
-            elif cmd in (curses.KEY_RIGHT, curses.KEY_ENTER, ord('l')):
-                self.open_submission()
-                self.draw()
-
-            elif cmd == ord('o'):
-                self.open_link()
-
-            elif cmd == ord('/'):
-                self.prompt_subreddit()
-                self.draw()
-
-            elif cmd in (curses.KEY_F5, ord('r')):
-                self.refresh_content()
-                self.draw()
-
-            elif cmd == curses.KEY_RESIZE:
-                self.draw()
-
-            elif cmd == ord('q'):
-                sys.exit()
-
-            else:
-                curses.beep()
-
+    @SubredditController.register(curses.KEY_F5, 'r')
     def refresh_content(self, name=None):
+        "Re-download all submissions and reset the page index"
 
-        name = name or self.name
-
+        name = name or self.content.name
         try:
             self.content = SubredditContent.from_name(
                 self.reddit, name, self.loader)
-
-        except (SubredditNameError, HTTPError):
-            display_message(self.stdscr, 'Invalid Subreddit')
-
+        except AccountError:
+            show_notification(self.stdscr, ['Not logged in'])
+        except SubredditError:
+            show_notification(self.stdscr, ['Invalid subreddit'])
+        except requests.HTTPError:
+            show_notification(self.stdscr, ['Could not reach subreddit'])
         else:
-            self.nav.page_index, self.nav.cursor_index = 0, 0
-            self.nav.inverted = False
-            self.name = name
+            self.nav = Navigator(self.content.get)
 
+    @SubredditController.register('f')
+    def search_subreddit(self, name=None):
+        "Open a prompt to search the given subreddit"
+
+        name = name or self.content.name
+        prompt = 'Search {}:'.format(name)
+        query = self.prompt_input(prompt)
+        if query is None:
+            return
+
+        try:
+            self.content = SubredditContent.from_name(
+                self.reddit, name, self.loader, query=query)
+        except IndexError: # if there are no submissions
+            show_notification(self.stdscr, ['No results found'])
+        else:
+            self.nav = Navigator(self.content.get)
+
+    @SubredditController.register('/')
     def prompt_subreddit(self):
-
-        attr = curses.A_BOLD | Color.MAGENTA
+        "Open a prompt to navigate to a different subreddit"
         prompt = 'Enter Subreddit: /r/'
-        n_rows, n_cols = self.stdscr.getmaxyx()
-        self.stdscr.addstr(n_rows-1, 0, prompt, attr)
-        self.stdscr.refresh()
-        window = self.stdscr.derwin(n_rows-1, len(prompt))
-        window.attrset(attr)
+        name = self.prompt_input(prompt)
+        if name is not None:
+            self.refresh_content(name=name)
 
-        out = text_input(window)
-        if out is not None:
-            self.refresh_content(name=out)
-
+    @SubredditController.register(curses.KEY_RIGHT, 'l')
     def open_submission(self):
         "Select the current submission to view posts"
 
-        submission = self.content.get(self.nav.absolute_index)['object']
-        page = SubmissionPage(self.stdscr, self.reddit, submission=submission)
+        data = self.content.get(self.nav.absolute_index)
+        page = SubmissionPage(self.stdscr, self.reddit, url=data['permalink'])
         page.loop()
 
+        if data['url'] == 'selfpost':
+            global opened_links
+            opened_links.add(data['url_full'])
+
+    @SubredditController.register(curses.KEY_ENTER, 10, 'o')
     def open_link(self):
+        "Open a link with the webbrowser"
 
         url = self.content.get(self.nav.absolute_index)['url_full']
-        webbrowser.open_new_tab(url)
+        open_browser(url)
+
+        global opened_links
+        opened_links.add(url)
+
+    @SubredditController.register('p')
+    def post_submission(self):
+        "Post a new submission to the given subreddit"
+
+        if not self.reddit.is_logged_in():
+            show_notification(self.stdscr, ['Login to post'])
+            return
+
+        # Strips the subreddit to just the name
+        # Make sure it is a valid subreddit for submission
+        subreddit = self.reddit.get_subreddit(self.content.name)
+        sub = str(subreddit).split('/')[2]
+        if '+' in sub or sub in ('all', 'front', 'me'):
+            show_notification(self.stdscr, ['Invalid subreddit'])
+            return
+
+        # Open the submission window
+        submission_info = SUBMISSION_FILE.format(name=sub)
+        curses.endwin()
+        submission_text = open_editor(submission_info)
+        curses.doupdate()
+
+        # Validate the submission content
+        if not submission_text:
+            show_notification(self.stdscr, ['Post canceled'])
+            return
+
+        if '\n' not in submission_text:
+            show_notification(self.stdscr, ['No content'])
+            return
+
+        try:
+            title, content = submission_text.split('\n', 1)
+            self.reddit.submit(sub, title, text=content)
+        except praw.errors.APIException as e:
+            message = ['Error: {}'.format(e.error_type), e.message]
+            show_notification(self.stdscr, message)
+            _logger.exception(e)
+        except requests.HTTPError as e:
+            show_notification(self.stdscr, ['Unexpected Error'])
+            _logger.exception(e)
+        else:
+            with self.loader(delay=0, message='Posting'):
+                time.sleep(2.0)
+            self.refresh_content()
 
     @staticmethod
     def draw_item(win, data, inverted=False):
@@ -113,23 +168,42 @@ class SubredditPage(BasePage):
         n_title = len(data['split_title'])
         for row, text in enumerate(data['split_title'], start=offset):
             if row in valid_rows:
-                attr = curses.A_BOLD
-                win.addstr(row, 1, text, attr)
+                text = clean(text)
+                win.addnstr(row, 1, text, n_cols - 1, curses.A_BOLD)
 
         row = n_title + offset
         if row in valid_rows:
-            attr = curses.A_UNDERLINE | Color.BLUE
-            text = '{url}'.format(**data)
-            win.addnstr(row, 1, text, n_cols-1, attr)
+            seen = (data['url_full'] in opened_links)
+            link_color = Color.MAGENTA if seen else Color.BLUE
+            attr = curses.A_UNDERLINE | link_color
+            text = clean(u'{url}'.format(**data))
+            win.addnstr(row, 1, text, n_cols - 1, attr)
 
         row = n_title + offset + 1
         if row in valid_rows:
-            text = '{created} {comments} {score}'.format(**data)
-            win.addnstr(row, 1, text, n_cols-1)
+            text = clean(u'{score} '.format(**data))
+            win.addnstr(row, 1, text, n_cols - 1)
+
+            if data['likes'] is None:
+                text, attr = BULLET, curses.A_BOLD
+            elif data['likes']:
+                text, attr = UARROW, curses.A_BOLD | Color.GREEN
+            else:
+                text, attr = DARROW, curses.A_BOLD | Color.RED
+            win.addnstr(text, n_cols - win.getyx()[1], attr)
+
+            text = clean(u' {created} {comments} '.format(**data))
+            win.addnstr(text, n_cols - win.getyx()[1])
+
+            if data['gold']:
+                text, attr = GOLD, (curses.A_BOLD | Color.YELLOW)
+                win.addnstr(text, n_cols - win.getyx()[1], attr)
 
         row = n_title + offset + 2
         if row in valid_rows:
-            text = '{author}'.format(**data)
-            win.addnstr(row, 1, text, n_cols-1, curses.A_BOLD)
-            text = ' {subreddit}'.format(**data)
+            text = clean(u'{author}'.format(**data))
+            win.addnstr(row, 1, text, n_cols - 1, curses.A_BOLD)
+            text = clean(u' {subreddit}'.format(**data))
             win.addnstr(text, n_cols - win.getyx()[1], Color.YELLOW)
+            text = clean(u' {flair}'.format(**data))
+            win.addnstr(text, n_cols - win.getyx()[1], Color.RED)

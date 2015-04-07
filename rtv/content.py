@@ -1,92 +1,13 @@
 import textwrap
-from datetime import datetime
-from contextlib import contextmanager
 
 import praw
-import six
+import requests
 
-from .errors import SubmissionURLError, SubredditNameError
+from .exceptions import SubmissionError, SubredditError, AccountError
+from .helpers import humanize_timestamp, wrap_text, strip_subreddit_url
 
+__all__ = ['SubredditContent', 'SubmissionContent']
 
-def clean(unicode_string):
-    """
-    Convert unicode string into ascii-safe characters.
-    """
-
-    if six.PY2:
-        ascii_string = unicode_string.encode('ascii', 'replace')
-    else:
-        ascii_string = unicode_string.encode().decode('ascii', 'replace')
-
-    ascii_string = ascii_string.replace('\\', '')
-    return ascii_string
-
-
-def split_text(big_text, width):
-    return [
-        text
-        for line in big_text.splitlines()
-        # wrap returns an empty list when "line" is a newline
-        # in order to consider newlines we need a list containing an
-        # empty string
-        for text in (textwrap.wrap(line, width=width) or [''])
-    ]
-
-
-def strip_subreddit_url(permalink):
-    """
-    Grab the subreddit from the permalink because submission.subreddit.url
-    makes a seperate call to the API.
-    """
-
-    subreddit = clean(permalink).split('/')[4]
-    return '/r/{}'.format(subreddit)
-
-
-def humanize_timestamp(utc_timestamp, verbose=False):
-    """
-    Convert a utc timestamp into a human readable relative-time.
-    """
-
-    timedelta = datetime.utcnow() - datetime.utcfromtimestamp(utc_timestamp)
-
-    seconds = int(timedelta.total_seconds())
-    if seconds < 60:
-        return 'moments ago' if verbose else '0min'
-    minutes = seconds // 60
-    if minutes < 60:
-        return ('%d minutes ago' % minutes) if verbose else ('%dmin' % minutes)
-    hours = minutes // 60
-    if hours < 24:
-        return ('%d hours ago' % hours) if verbose else ('%dhr' % hours)
-    days = hours // 24
-    if days < 30:
-        return ('%d days ago' % days) if verbose else ('%dday' % days)
-    months = days // 30.4
-    if months < 12:
-        return ('%d months ago' % months) if verbose else ('%dmonth' % months)
-    years = months // 12
-    return ('%d years ago' % years) if verbose else ('%dyr' % years)
-
-def validate_backslashes(name):
-    """
-    Makes sure backslashes in subreddit name work with for_name()
-    """
-
-    if name[0] == '/':
-        raise SubredditNameError(name)
-       
-    if name[-1] == '/':
-        name = name[:-1]
-
-    if name.count('/') > 1:
-        raise SubredditNameError(name)
-
-    return name
-
-@contextmanager
-def default_loader(self):
-    yield
 
 class BaseContent(object):
 
@@ -96,12 +17,10 @@ class BaseContent(object):
     def iterate(self, index, step, n_cols):
 
         while True:
-
-            # Hack to prevent displaying negative indicies if iterating in the
-            # negative direction.
             if step < 0 and index < 0:
+                # Hack to prevent displaying negative indicies if iterating in
+                # the negative direction.
                 break
-
             try:
                 yield self.get(index, n_cols=n_cols)
             except IndexError:
@@ -122,6 +41,9 @@ class BaseContent(object):
         retval = []
         while stack:
             item = stack.pop(0)
+            if isinstance(item, praw.objects.MoreComments) and (
+                    item.count == 0):
+                continue
             nested = getattr(item, 'replies', None)
             if nested:
                 for n in nested:
@@ -147,15 +69,17 @@ class BaseContent(object):
             data['body'] = 'More comments'.format(comment.count)
         else:
             data['type'] = 'Comment'
-            data['body'] = clean(comment.body)
+            data['body'] = comment.body
             data['created'] = humanize_timestamp(comment.created_utc)
             data['score'] = '{} pts'.format(comment.score)
-            data['author'] = (clean(comment.author.name) if
-                              getattr(comment, 'author') else '[deleted]')
-
-            sub_author = (clean(comment.submission.author.name) if
-                          getattr(comment.submission, 'author') else '[deleted]')
+            author = getattr(comment, 'author')
+            data['author'] = (author.name if author else '[deleted]')
+            sub_author = getattr(comment.submission.author, 'name')
             data['is_author'] = (data['author'] == sub_author)
+            flair = comment.author_flair_text
+            data['flair'] = (flair if flair else '')
+            data['likes'] = comment.likes
+            data['gold'] = comment.gilded > 0
 
         return data
 
@@ -171,17 +95,20 @@ class BaseContent(object):
         data = {}
         data['object'] = sub
         data['type'] = 'Submission'
-        data['title'] = clean(sub.title)
-        data['text'] = clean(sub.selftext)
+        data['title'] = sub.title
+        data['text'] = sub.selftext
         data['created'] = humanize_timestamp(sub.created_utc)
         data['comments'] = '{} comments'.format(sub.num_comments)
         data['score'] = '{} pts'.format(sub.score)
-        data['author'] = (clean(sub.author.name) if getattr(sub, 'author')
-                          else '[deleted]')
-        data['permalink'] = clean(sub.permalink)
+        author = getattr(sub, 'author')
+        data['author'] = (author.name if author else '[deleted]')
+        data['permalink'] = sub.permalink
         data['subreddit'] = strip_subreddit_url(sub.permalink)
-        data['url_full'] = clean(sub.url)
-        data['url'] = ('selfpost' if is_selfpost(sub.url) else clean(sub.url))
+        data['flair'] = (sub.link_flair_text if sub.link_flair_text else '')
+        data['url_full'] = sub.url
+        data['url'] = ('selfpost' if is_selfpost(sub.url) else sub.url)
+        data['likes'] = sub.likes
+        data['gold'] = sub.gilded > 0
 
         return data
 
@@ -192,49 +119,28 @@ class SubmissionContent(BaseContent):
     list for repeat access.
     """
 
-    def __init__(
-            self,
-            submission,
-            loader=default_loader,
-            indent_size=2,
-            max_indent_level=4):
+    def __init__(self, submission, loader, indent_size=2, max_indent_level=4):
 
         self.indent_size = indent_size
         self.max_indent_level = max_indent_level
         self._loader = loader
         self._submission = submission
-        self._submission_data = None
-        self._comment_data = None
-        self.name = None
 
-        self.reset()
+        self._submission_data = self.strip_praw_submission(self._submission)
+        self.name = self._submission_data['permalink']
+        comments = self.flatten_comments(self._submission.comments)
+        self._comment_data = [self.strip_praw_comment(c) for c in comments]
 
     @classmethod
-    def from_url(
-            cls,
-            reddit,
-            url,
-            loader=default_loader,
-            indent_size=2,
-            max_indent_level=4):
+    def from_url(cls, reddit, url, loader, indent_size=2, max_indent_level=4):
 
         try:
             with loader():
-                submission = reddit.get_submission(url)
-
+                submission = reddit.get_submission(url, comment_sort='hot')
         except praw.errors.APIException:
-            raise SubmissionURLError(url)
+            raise SubmissionError(url)
 
         return cls(submission, loader, indent_size, max_indent_level)
-
-    def reset(self):
-
-        with self._loader():
-            self._submission.refresh()
-            self._submission_data = self.strip_praw_submission(self._submission)
-            self.name = self._submission_data['permalink']
-            comments = self.flatten_comments(self._submission.comments)
-            self._comment_data = [self.strip_praw_comment(c) for c in comments]
 
     def get(self, index, n_cols=70):
         """
@@ -247,9 +153,9 @@ class SubmissionContent(BaseContent):
 
         elif index == -1:
             data = self._submission_data
-            data['split_title'] = textwrap.wrap(data['title'], width=n_cols-2)
-            data['split_text'] = split_text(data['text'], width=n_cols-2)
-            data['n_rows'] = (len(data['split_title']) + len(data['split_text']) + 5)
+            data['split_title'] = textwrap.wrap(data['title'], width=n_cols -2)
+            data['split_text'] = wrap_text(data['text'], width=n_cols - 2)
+            data['n_rows'] = len(data['split_title'] + data['split_text']) + 5
             data['offset'] = 0
 
         else:
@@ -258,8 +164,8 @@ class SubmissionContent(BaseContent):
             data['offset'] = indent_level * self.indent_size
 
             if data['type'] == 'Comment':
-                data['split_body'] = split_text(
-                    data['body'], width=n_cols-data['offset'])
+                width = n_cols - data['offset']
+                data['split_body'] = wrap_text(data['body'], width=width)
                 data['n_rows'] = len(data['split_body']) + 1
             else:
                 data['n_rows'] = 1
@@ -283,7 +189,7 @@ class SubmissionContent(BaseContent):
         elif data['type'] == 'Comment':
             cache = [data]
             count = 1
-            for d in self.iterate(index+1, 1, n_cols):
+            for d in self.iterate(index + 1, 1, n_cols):
                 if d['level'] <= data['level']:
                     break
 
@@ -296,17 +202,18 @@ class SubmissionContent(BaseContent):
             comment['count'] = count
             comment['level'] = data['level']
             comment['body'] = 'Hidden'.format(count)
-            self._comment_data[index:index+len(cache)] = [comment]
+            self._comment_data[index:index + len(cache)] = [comment]
 
         elif data['type'] == 'HiddenComment':
-            self._comment_data[index:index+1] = data['cache']
+            self._comment_data[index:index + 1] = data['cache']
 
         elif data['type'] == 'MoreComments':
             with self._loader():
-                comments = data['object'].comments()
-                comments = self.flatten_comments(comments, root_level=data['level'])
+                comments = data['object'].comments(update=False)
+                comments = self.flatten_comments(comments,
+                                                 root_level=data['level'])
                 comment_data = [self.strip_praw_comment(c) for c in comments]
-                self._comment_data[index:index+1] = comment_data
+                self._comment_data[index:index + 1] = comment_data
 
         else:
             raise ValueError('% type not recognized' % data['type'])
@@ -314,86 +221,89 @@ class SubmissionContent(BaseContent):
 
 class SubredditContent(BaseContent):
     """
-    Grabs a subreddit from PRAW and lazily stores submissions to an internal
+    Grab a subreddit from PRAW and lazily stores submissions to an internal
     list for repeat access.
     """
 
-    def __init__(self, name, submissions, loader=default_loader):
+    def __init__(self, name, submissions, loader):
 
         self.name = name
         self._loader = loader
         self._submissions = submissions
         self._submission_data = []
 
+        # Verify that content exists for the given submission generator.
+        # This is necessary because PRAW loads submissions lazily, and
+        # there is is no other way to check things like multireddits that
+        # don't have a real corresponding subreddit object.
+        try:
+            self.get(0)
+        except (praw.errors.APIException, requests.HTTPError,
+                praw.errors.RedirectException):
+            raise SubredditError(name)
+
     @classmethod
-    def from_name(cls, reddit, name, loader=default_loader, display_type = 'hot'):
+    def from_name(cls, reddit, name, loader, order='hot', query=None):
 
-        if name == 'new':
-            return cls('New', reddit.get_new(limit=None), loader)
+        name = name.strip(' /')  # Strip leading and trailing backslashes
+        if name.startswith('r/'):
+            name = name[2:]
 
-        if name == 'all':
-            sub = reddit.get_subreddit(name)
+        # Grab the display order e.g. "python/new"
+        if '/' in name:
+            name, order = name.split('/')
+
+        display_name = display_name = '/r/{}'.format(name)
+        if order != 'hot':
+            display_name += '/{}'.format(order)
+
+        if order not in ['hot', 'top', 'rising', 'new', 'controversial']:
+            raise SubredditError(name)
+
+        if name == 'me':
+            if not reddit.is_logged_in():
+                raise AccountError
+            else:
+                submissions = reddit.user.get_submitted(sort=order)
+
+        elif query:
+            if name == 'front':
+                submissions = reddit.search(query, subreddit=None, sort=order)
+            else:
+                submissions = reddit.search(query, subreddit=name, sort=order)
 
         else:
-
-            name = validate_backslashes(name)
-
-            if '/' in name:
-                name, display_type = name.split('/')
-
-            if display_type not in ['new', 'top', 'hot', 'rising', 'controversial']:
-                raise SubredditNameError(name)
-
             if name == 'front':
-                
-                if display_type == 'new':
-                    return cls('New', reddit.get_new(limit=None), loader)
+                dispatch = {
+                    'hot': reddit.get_front_page,
+                    'top': reddit.get_top,
+                    'rising': reddit.get_rising,
+                    'new': reddit.get_new,
+                    'controversial': reddit.get_controversial,
+                    }
+            else:
+                subreddit = reddit.get_subreddit(name)
+                dispatch = {
+                    'hot': subreddit.get_hot,
+                    'top': subreddit.get_top,
+                    'rising': subreddit.get_rising,
+                    'new': subreddit.get_new,
+                    'controversial': subreddit.get_controversial,
+                    }
+            submissions = dispatch[order](limit=None)
 
-                elif display_type == 'top':
-                    return cls('Top', reddit.get_top(limit=None), loader)
-
-                elif display_type == 'hot':
-                    return cls('Front Page', reddit.get_front_page(limit=None), loader)
-
-                elif display_type == 'rising':
-                    return cls('Rising', reddit.get_rising(limit=None), loader)
-
-                elif display_type == 'controversial':
-                    return cls('Controversial', reddit.get_controversial(limit=None), loader)
-
-            try:
-                with loader():
-                    sub = reddit.get_subreddit(name, fetch=True)
-            except praw.errors.ClientException:
-                raise SubredditNameError(name)
-
-        if display_type == 'new':
-            return cls('/r/'+sub.display_name+'/new', sub.get_new(limit=None), loader)
-
-        elif display_type == 'top':
-            return cls('/r/'+sub.display_name+'/top', sub.get_top_from_all(limit=None), loader)
-
-        elif display_type == 'hot':
-            return cls('/r/'+sub.display_name, sub.get_hot(limit=None), loader)
-
-        elif display_type == 'rising':
-            return cls('/r/'+sub.display_name+'/rising', sub.get_rising(limit=None), loader)
-
-        elif display_type == 'controversial':
-            return cls('/r/'+sub.display_name+'/controversial', sub.get_controversial(limit=None), loader)
-
+        return cls(display_name, submissions, loader)
 
     def get(self, index, n_cols=70):
         """
         Grab the `i`th submission, with the title field formatted to fit inside
-        of a window of width `n`
+        of a window of width `n_cols`
         """
 
         if index < 0:
             raise IndexError
 
         while index >= len(self._submission_data):
-
             try:
                 with self._loader():
                     submission = next(self._submissions)
